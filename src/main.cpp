@@ -3,100 +3,127 @@
 #include "Adafruit_VL53L1X.h"
 #include "Adafruit_GFX.h"
 #include "Adafruit_LEDBackpack.h"
+#include "RTClib.h"
 
-// VL53L1X Time of Flight Sensor stuffs
-const int sensorCount = 2;
-const int xshutPins[sensorCount] = {5, 6};
-Adafruit_VL53L1X VL53Array[sensorCount];
+// DS3231 Real Time Clock stuff
+RTC_DS3231 rtc;
+
+// VL53L1X Time of Flight stuff
+Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
 
 // 1.2" 7-Segment Display stuff
 Adafruit_7segment display1 = Adafruit_7segment();
 Adafruit_7segment display2 = Adafruit_7segment();
 
+// counters and other relevant variables
+int vl53_distance;
+int transitCounter = 0;
+boolean isObjectDetected = false;
+boolean pastObjectDetect = false;
+
+unsigned long timeWhenTOFLost = 0, timeWhenTOFRestored, timeTOFDifference;
+boolean wasTOFLost = false;
+
 void setup() {
   while (!Serial) {}
   Serial.begin(115200);
   Wire.begin();
-
-  // VL53L1X Time of Flight Sensor stuffs
-  for (int i = 0; i < sensorCount; i++) {
-    pinMode(xshutPins[i], OUTPUT);
-    digitalWrite(xshutPins[i], LOW);
+  
+  if (! vl53.begin(0x29, &Wire)) {
+    Serial.print(F("Error on init of VL sensor: "));
+    Serial.println(vl53.vl_status);
+    while (1)       delay(10);
   }
+  Serial.println(F("VL53L1X sensor OK!"));
 
-  for (int j = 0; j < sensorCount; j++) {
-    pinMode(xshutPins[j], INPUT);
-    delay(10);
+  Serial.print(F("Sensor ID: 0x"));
+  Serial.println(vl53.sensorID(), HEX);
 
-    if (!VL53Array[j].begin(0x2A + j, &Wire)) {
-      Serial.print(F("Error on init of VL sensor: "));
-      Serial.println(VL53Array[j].vl_status);
-      while (1)       delay(10);
-    }
-
-    if (!VL53Array[j].startRanging()) {
-      Serial.print(F("Couldn't start ranging: "));
-      Serial.println(VL53Array[j].vl_status);
-      while (1)       delay(10);
-    }
-
-    Serial.print(F("VL53L1X sensor with ID: 0x"));
-    Serial.print(0x2A + j);
-    Serial.println(F(" OK!"));
-
-    VL53Array[j].setTimingBudget(100);
+  if (! vl53.startRanging()) {
+    Serial.print(F("Couldn't start ranging: "));
+    Serial.println(vl53.vl_status);
+    while (1)       delay(10);
   }
-
   Serial.println(F("Ranging started"));
 
+  // Valid timing budgets: 15, 20, 33, 50, 100, 200 and 500ms!
+  vl53.setTimingBudget(200);
+  Serial.print(F("Timing budget (ms): "));
+  Serial.println(vl53.getTimingBudget());
+  
+  vl53.VL53L1X_SetDistanceMode(1);
+
   // 1.2" 7-Segment Display stuff
-  display1.begin(0x70);
-  display2.begin(0x71);
+  display1.begin(0x71);
+  display2.begin(0x70);
 }
 
 void loop() {
 
-  int VL53_0_distance;
-  int VL53_1_distance;
-
-  if (VL53Array[0].dataReady() && VL53Array[1].dataReady()) {
+  if (vl53.dataReady()) {
 
     // new measurement for the taking!
-    VL53_0_distance = VL53Array[0].distance();
-    VL53_1_distance = VL53Array[1].distance();
+    vl53_distance = vl53.distance();
 
-    if (VL53_0_distance == -1) {
-      // something went wrong!
-      Serial.print(F("VL53L1X (0x2A) couldn't get distance! -> "));
-      Serial.println(VL53Array[0].vl_status);
+    if (vl53_distance == -1) {
+      // something went wrong! (lost object)
+
+      if (!wasTOFLost) {
+        timeWhenTOFLost = millis();
+        wasTOFLost = true;
+        pastObjectDetect = false;
+      }
+
+      display1.print(99999, DEC);
+      display1.writeDisplay();
+
+      Serial.print(F("VL53L1X couldn't get distance! -> "));
+      Serial.println(vl53.vl_status);
       return;
     }
 
-    if (VL53_1_distance == -1) {
-      // something went wrong!
-      Serial.print(F("VL53L1X (0x2B) couldn't get distance! -> "));
-      Serial.println(VL53Array[1].vl_status);
-      return;
+    if (wasTOFLost) {
+      timeWhenTOFRestored = millis();
+      timeTOFDifference = timeWhenTOFRestored - timeWhenTOFLost; // time (in ms) it took for measurements from the VL53L1X to be restored.
+
+      if (timeTOFDifference < 200) {
+        return;
+      } else {
+        wasTOFLost = false;
+      }
     }
+
+    if (vl53_distance <= 800) {
+      isObjectDetected = true;
+    } else {
+      isObjectDetected = false;
+    }
+
+    if (isObjectDetected && !pastObjectDetect) {
+      transitCounter++;
+      pastObjectDetect = true;
+    } else if (!isObjectDetected) {
+      pastObjectDetect = false;
+    }
+
+    Serial.println(isObjectDetected);
+    Serial.println(pastObjectDetect);
+    Serial.println();
 
     Serial.println(F("Distances (mm): "));
-    Serial.println("0x2A | 0x2B");
-    Serial.print(" ");
-    Serial.print(VL53_0_distance);
-    Serial.print("  |  ");
-    Serial.println(VL53_1_distance);
+    Serial.println(vl53_distance);
 
     // data is read out, time for another reading!
-    VL53Array[0].clearInterrupt();
-    VL53Array[1].clearInterrupt();
+    vl53.clearInterrupt();
 
   }
 
-  display1.print(VL53_0_distance);
-  display2.print(VL53_1_distance);
-
+  display1.print(vl53_distance);
   display1.writeDisplay();
+
+  display2.print(transitCounter);
   display2.writeDisplay();
+
 
   delay(100);
 
