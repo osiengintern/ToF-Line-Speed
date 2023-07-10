@@ -1,3 +1,5 @@
+// TODO: Decrease precision from #.### to #.## to improve time til overflow from 49 days (7 weeks) to roughly 497 days (more than 1 year).
+
 #include <Wire.h>
 #include "Arduino.h"
 #include "Adafruit_VL53L1X.h"
@@ -19,38 +21,46 @@ Adafruit_7segment clockDisplay = Adafruit_7segment();
 // Time Of Flight Sensor (VL53L1X) Class Definition
 class ToFSensor : public Adafruit_VL53L1X {
   public:
-    ToFSensor() { millisObjectDetected = 0, millisObjectLost = 0; };
-    void takeMeasurement() { distanceMeasurement = distance(); };
+    ToFSensor(int);
+    int I2C_ID;
+    void takeMeasurement() { measurementDistance = distance(); };
     void objectDetectCheck();
-    int distanceMeasurement;
+    int measurementDistance;
     int transitCounter;
-    unsigned long millisObjectDetected, millisObjectLost;
+    unsigned long millisObjectDetected, millisObjectLost, holdingMillis; 
     boolean previousObjectDetected, previousMeasurementLost;    
 };
 
+//HOLDING MILLIS
+  // this variable will hold the time that an object was detected until 200 milliseconds have passed, after which it will pass the value on to millisObjectDetected.
+  // this ensures that whenever millisObjectDetected is pulled, it is the most recent time that a confirmed object has passed the sensor.
+ToFSensor::ToFSensor(int ID) {
+  I2C_ID = ID, millisObjectDetected = 0, millisObjectLost = 0, holdingMillis = 0;
+}
+
 void ToFSensor::objectDetectCheck() {
 // TODO: might want to add a minimum distance range as well.
-  if (distanceMeasurement == -1 || distanceMeasurement >= REFLECTOR_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
+  if (measurementDistance == -1 || measurementDistance >= REFLECTOR_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
     if (!previousMeasurementLost) { // only runs once (the first time when sensor can no longer detect a T-Bar)
       millisObjectLost = millis(); // timestamp of when the sensor can no longer detect a t-bar
 
-      Serial.println(F("VL53L1X: Can't see anything.")); // TODO: get Sensor ID showing.
+      Serial.print(F("VL53L1X ("));
+      Serial.print(I2C_ID);
+      Serial.println(F("): Can't see anything."));
       previousMeasurementLost = true;
     }
 
     if (millis() - millisObjectLost > OBJECT_DETECTION_THRESHOLD) { // if the sensor doesn't see a t-bar for more than 0.2 seconds, consider the component has gone past the sensor
       previousObjectDetected = false;
     }
-  } else { // the sensor CAN see a t-bar/component
-
-    // this variable will hold the time that an object was detected until 200 milliseconds have passed, after which it will pass the value on to millisObjectDetected.
-    // this ensures that whenever millisObjectDetected is pulled, it is the most recent time that a confirmed object has passed the sensor.
-    unsigned long holdingMillis; 
+  } else { // the sensor CAN see a t-bar/component    
 
     if (previousMeasurementLost) { // the first time the sensor does detect a t-bar
       holdingMillis = millis();
       
-      Serial.println(F("VL53L1X: Possible object.")); // TODO: get Sensor ID showing.
+      Serial.print(F("VL53L1X ("));
+      Serial.print(I2C_ID);
+      Serial.println(F("): Possible object."));
       previousMeasurementLost = false;
     }
 
@@ -58,22 +68,23 @@ void ToFSensor::objectDetectCheck() {
       millisObjectDetected = holdingMillis;
       previousObjectDetected = true;
 
-      Serial.println(F("VL53L1X: Object successfully detected!")); // TODO: get Sensor ID showing.
+      Serial.print(F("VL53L1X ("));
+      Serial.print(I2C_ID);
+      Serial.println(F("): Object successfully detected!"));
     }
   }
 }
 
 // VL53L1X Time of Flight stuff
-ToFSensor VLSensorArray[2]; // hard coded simply because there are only two VL53L1X sensors being used.
+ToFSensor VLSensorArray[] = { ToFSensor(0x2A), ToFSensor(0x2B) }; // IDs are hard coded simply because there are only two VL53L1X sensors being used.
 const int xshutPins[2] = {5, 6};
 
 unsigned long previousMillis_RTCPrintOut = 0; // the last time the time was printed to serial from the RTC
+int DEBUG_HERTZ_COUNTER;
 
 // function prototypes
 void printCurrentTime(DateTime);
-
-//DEBUG STUFF
-int DEBUG_HERTZ_COUNTER;
+void printDebugToSerial();
 
 void setup() {
   while (!Serial); // wait for serial port to connect. Needed for native USB
@@ -95,7 +106,7 @@ void setup() {
     pinMode(xshutPins[j], INPUT);
     delay(10);
 
-    if (!VLSensorArray[j].begin(0x2A + j, &Wire)) {
+    if (!VLSensorArray[j].begin(0x2A + j, &Wire)) { // 0x2A
       Serial.print(F("VL53L1X Sensor (ID: "));
       Serial.print(0x2A + j);
       Serial.print(F("): Initialization Error -> "));
@@ -103,7 +114,7 @@ void setup() {
       while (1)       delay(10);
     }
 
-    if (!VLSensorArray[j].startRanging()) {
+    if (!VLSensorArray[j].startRanging()) { // 0x2B
       Serial.print(F("VL53L1X Sensor (ID: "));
       Serial.print(0x2A + j);
       Serial.print(F("): Couldn't start ranging -> "));
@@ -113,10 +124,10 @@ void setup() {
 
     Serial.print(F("VL53L1X Sensor (ID: "));
     Serial.print(0x2A + j);
-    Serial.print(F("): Successfully initialized!"));
+    Serial.println(F("): Successfully initialized!"));
 
     // Valid timing budgets: 15, 20, 33, 50, 100, 200 and 500ms!
-    VLSensorArray[j].setTimingBudget(15);
+    VLSensorArray[j].setTimingBudget(100);
     Serial.print(F("VL53L1X Sensor (ID: "));
     Serial.print(0x2A + j);
     Serial.print(F("): Timing budget in ms -> "));
@@ -124,11 +135,19 @@ void setup() {
 
   }
 
-  Serial.println(F("Ranging started"));
+  Serial.println(F("All VL53L1X sensors are initialized!"));
 
   // 1.2" 7-Segment Display stuff
   FPSDisplay.begin(0x71);
   clockDisplay.begin(0x70);
+
+  FPSDisplay.print("INIT");
+  clockDisplay.print("INIT");
+  FPSDisplay.writeDisplay();
+  clockDisplay.writeDisplay();
+
+  Serial.println(F("Setup is complete. The main program will now begin."));
+
 }
 
 void loop() {
@@ -138,38 +157,47 @@ void loop() {
   if (VLSensorArray[0].dataReady()) {
 
     VLSensorArray[0].takeMeasurement();
-    VLSensorArray[0].objectDetectCheck();   
-
-    if (VLSensorArray[0].previousObjectDetected) {
-      FPSDisplay.print(1, DEC);
-    } else {
-      FPSDisplay.print(0, DEC);
-    }
-    FPSDisplay.writeDisplay();
-    
-    int smthlikeyou = VLSensorArray[0].millisObjectDetected / 10;
-    clockDisplay.print(smthlikeyou);
-    clockDisplay.drawColon(true);
-    clockDisplay.writeDisplay();
-
-    Serial.println();
-    Serial.println(smthlikeyou);
-    Serial.println();
+    VLSensorArray[0].objectDetectCheck();
 
   }
 
   if (VLSensorArray[1].dataReady()) {
 
-    // new distanceMeasurement for the taking!
     VLSensorArray[1].takeMeasurement();
-    //VLSensorArray[1].objectDetectCheck();
-    //^ uncommenting this somehow breaks the whole thing. i bet its smth with values from different sensors being tied up as a result of the class inheritance thing. check it out.
+    VLSensorArray[1].objectDetectCheck();
 
-    //clockDisplay.print(VLSensorArray[1].distanceMeasurement);
-    //clockDisplay.writeDisplay();
-  }
+  }  
 
+  FPSDisplay.print(VLSensorArray[0].millisObjectDetected / 10);
+  FPSDisplay.drawColon(true);
+  FPSDisplay.writeDisplay();
+
+  clockDisplay.print(VLSensorArray[1].millisObjectDetected / 10);
+  clockDisplay.writeDisplay();
+
+  printDebugToSerial();
   DEBUG_HERTZ_COUNTER++;
+}
+
+void printDebugToSerial() {
+
+  Serial.println(F(" \t \t 0x2A (42) \t 0x2B (43)"));
+  Serial.print(F("Distances (mm):  "));
+  Serial.print(VLSensorArray[0].measurementDistance);
+  Serial.print(F(" \t \t "));
+  Serial.println(VLSensorArray[1].measurementDistance);
+  
+  // TODO: improve the hertz rate. it's going from 90s to 70s because of the division i assume.
+  Serial.print(F("Last Detection:  "));
+  Serial.print(VLSensorArray[0].millisObjectDetected / 1000);
+  Serial.print(F("."));
+  Serial.print(VLSensorArray[0].millisObjectDetected % 1000);
+  Serial.print(F(" \t \t "));
+  Serial.print(VLSensorArray[1].millisObjectDetected / 1000);
+  Serial.print(F("."));
+  Serial.println(VLSensorArray[1].millisObjectDetected % 1000);
+  Serial.println(F("(#.### s):  "));
+  Serial.println();
 
 }
 
@@ -192,16 +220,13 @@ void printCurrentTime(DateTime now) {
     Serial.print(now.second(), DEC);
     Serial.println();
 
-    previousMillis_RTCPrintOut = millis();
-
-    
-
-    //DEBUG STUFF
     Serial.print(F("The program is running at "));
     Serial.print(DEBUG_HERTZ_COUNTER);
     Serial.println(F(" Hertz."));
     Serial.println();
+
     DEBUG_HERTZ_COUNTER = 0;
+    previousMillis_RTCPrintOut = millis();
     
   }  
 }
