@@ -1,5 +1,8 @@
 // TODO: Decrease precision from #.### to #.## to improve time til overflow from 49 days (7 weeks) to roughly 497 days (more than 1 year).
 // TODO: URGENT: 2077 gets reduced to 2.77 in the serial debugging.
+// TODO: Add rolling average display function, add clock time function as well.
+// TODO: 350 feet to oven. Calculate the time it would take to reach there.
+// TODO: might want to add a minimum distance range as well for object detection.
 
 #include <Wire.h>
 #include "Arduino.h"
@@ -8,11 +11,14 @@
 #include "Adafruit_LEDBackpack.h"
 #include "RTClib.h"
 
-#define REFLECTOR_DISTANCE 1000 //millimeters
+#define MAXIMUM_THRESHOLD_DISTANCE 1000 //millimeters
+#define MINIMUM_THRESHOLD_DISTANCE 500 //millimeters
 #define RTC_PRINT_INTERVAL 5 //seconds (the time in between RTC print outs)
-#define OBJECT_DETECTION_THRESHOLD 200 //milliseconds
-#define ROLLING_AVERAGE_ARRAY_SIZE 3
+#define OBJECT_DETECTION_TIMING_THRESHOLD 200 //milliseconds
+#define ROLLING_AVERAGE_ARRAY_SIZE 10
 #define INCHES_BETWEEN_VL53L1X_SENSORS 4
+#define DISTANCE_FROM_MONITOR_TO_OVEN 350 //feet
+#define TOTAL_LENGTH_OF_OVEN 225 //feet
 
 // DS3231 Real Time Clock stuff
 RTC_DS3231 rtc;
@@ -28,6 +34,7 @@ int findNextAvailableIndexInArray(unsigned long[]);
 int addValueToArray(unsigned long[], unsigned long, int);
 int addValueToArray(double[], double, int);
 void calculateLineSpeed(int);
+DateTime timeToStopHanging(DateTime);
 
 unsigned long VLOneDetectionTimes[ROLLING_AVERAGE_ARRAY_SIZE]; // 0x2A (42)
 unsigned long VLTwoDetectionTimes[ROLLING_AVERAGE_ARRAY_SIZE]; // 0x2B (43)
@@ -58,8 +65,7 @@ ToFSensor::ToFSensor(int ID) {
 }
 
 void ToFSensor::objectDetectCheck() {
-// TODO: might want to add a minimum distance range as well.
-  if (measurementDistance == -1 || measurementDistance >= REFLECTOR_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
+  if (measurementDistance == -1 || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
     if (!previousMeasurementLost) { // only runs once (the first time when sensor can no longer detect a T-Bar)
       millisObjectLost = millis(); // timestamp of when the sensor can no longer detect a t-bar
 
@@ -69,7 +75,7 @@ void ToFSensor::objectDetectCheck() {
       previousMeasurementLost = true;
     }
 
-    if (millis() - millisObjectLost > OBJECT_DETECTION_THRESHOLD) { // if the sensor doesn't see a t-bar for more than 0.2 seconds, consider the component has gone past the sensor
+    if (millis() - millisObjectLost > OBJECT_DETECTION_TIMING_THRESHOLD) { // if the sensor doesn't see a t-bar for more than 0.2 seconds, consider the component has gone past the sensor
       previousObjectDetected = false;
     }
 
@@ -84,7 +90,7 @@ void ToFSensor::objectDetectCheck() {
       previousMeasurementLost = false;
     }
 
-    if ((millis() - holdingMillis > OBJECT_DETECTION_THRESHOLD) && !previousObjectDetected) {
+    if ((millis() - holdingMillis > OBJECT_DETECTION_TIMING_THRESHOLD) && !previousObjectDetected) {
       millisObjectDetected = holdingMillis;
       previousObjectDetected = true;
 
@@ -98,6 +104,7 @@ void ToFSensor::objectDetectCheck() {
 
           if (nextVLTwoIndex == -1) {
             addValueToArray(VLOneDetectionTimes, millisObjectDetected, ROLLING_AVERAGE_ARRAY_SIZE - 1);
+            Serial.println(F("Data replaced."));
           } else {
             // insert the value at the latest matching index, and replace the current value.
             addValueToArray(VLOneDetectionTimes, millisObjectDetected, nextVLTwoIndex);
@@ -127,8 +134,8 @@ void ToFSensor::objectDetectCheck() {
           Serial.println(F("): Data discarded! (Sensor 42 missed data.)"));
 
         } else { // what we expect to happen
-          int finalIndexLocation = addValueToArray(VLTwoDetectionTimes, millisObjectDetected, nextVLTwoIndex);
-          calculateLineSpeed(finalIndexLocation);
+          addValueToArray(VLTwoDetectionTimes, millisObjectDetected, nextVLTwoIndex);
+          calculateLineSpeed(nextVLTwoIndex);
 
           VLTwoTransitCounter++;
 
@@ -263,14 +270,22 @@ void loop() {
     VLSensorArray[1].takeMeasurement();
     VLSensorArray[1].objectDetectCheck();
 
-  }  
+  }
 
-  FPSDisplay.print(VLSensorArray[1].millisObjectDetected / 10);
+  DateTime stopHanging = timeToStopHanging(now);
+
+
+  //FPSDisplay.print(timeToStopHanging(now));
   FPSDisplay.drawColon(true);
   FPSDisplay.writeDisplay();
 
   //clockDisplay.print(VLSensorArray[1].millisObjectDetected / 10);
   clockDisplay.print(rollingAverageLineSpeed);
+  if (rollingAverageLineSpeed >= 100) {
+    clockDisplay.writeDigitRaw(2, 0x10);
+  } else {
+    clockDisplay.writeDigitRaw(2, 0x02);
+  }
   clockDisplay.writeDisplay();
 
   //printDebugToSerial();
@@ -342,29 +357,34 @@ int addValueToArray(double array[], double valueToInsert, int index) {
   return index;
 }
 
-void calculateLineSpeed(int index) {
+void calculateLineSpeed(int insertIndex) {
+  int dataIndex = insertIndex;
+
+  if (insertIndex == -1) {
+    dataIndex = ROLLING_AVERAGE_ARRAY_SIZE - 1;
+  }
+
   double distanceBetweenSensorsInFeet = INCHES_BETWEEN_VL53L1X_SENSORS / 12.0;
 
-  unsigned long timeOne = VLOneDetectionTimes[index];
-  unsigned long timeTwo = VLTwoDetectionTimes[index]; 
+  unsigned long firstSensorTime = VLOneDetectionTimes[dataIndex];
+  unsigned long secondSensorTime = VLTwoDetectionTimes[dataIndex]; 
 
-  unsigned long timeDifInMS = timeTwo - timeOne;
+  unsigned long timeDifInMS = secondSensorTime - firstSensorTime;
 
   double timeDifInMinutes = timeDifInMS / 60000.0;
 
   double lineSpeedInFPM = distanceBetweenSensorsInFeet / timeDifInMinutes;
 
-  addValueToArray(lineSpeeds, lineSpeedInFPM, index);
+  addValueToArray(lineSpeeds, lineSpeedInFPM, insertIndex);
 
-  // calculates the rolling average. nextAvailableIndex + 1 tells you how many values are in the array at the time, used to calculate the denominator of the average
+  // calculates the rolling average. dataIndex + 1 tells you how many values are in the array at the time, used to calculate the denominator of the average
   double sum = 0.0;
 
-  for (int i = 0; i <= index; i++) {
+  for (int i = 0; i <= dataIndex; i++) {
     sum += lineSpeeds[i];
   }
 
-  //TODO: see if this still works with the data validation system.
-  rollingAverageLineSpeed = sum / (index + 1);
+  rollingAverageLineSpeed = sum / (dataIndex + 1);
 
   Serial.print(F("linespeed: "));
   for (int i = 0; i < ROLLING_AVERAGE_ARRAY_SIZE; i++) {
@@ -376,9 +396,21 @@ void calculateLineSpeed(int index) {
   Serial.print(F("rolling avr: "));
   Serial.println(rollingAverageLineSpeed);
   Serial.print(F("index: "));
-  Serial.println(index);
+  Serial.println(dataIndex);
   Serial.print(F("sum: "));
   Serial.println(sum);
+}
+
+DateTime timeToStopHanging(DateTime now) {
+  
+  int minutesUntilPartsReachOven = int((DISTANCE_FROM_MONITOR_TO_OVEN / rollingAverageLineSpeed) + 0.5);
+
+  int minutesPartsInOven = int((TOTAL_LENGTH_OF_OVEN / rollingAverageLineSpeed + 0.5));
+
+  DateTime lineStopTime (now.year(), now.month(), now.day(), 16, 30, 0);
+  DateTime stopHangingTime (lineStopTime - TimeSpan(0, 0, (minutesUntilPartsReachOven + minutesPartsInOven), 0));
+
+  return stopHangingTime;
 }
 
 void printDebugToSerial() {
