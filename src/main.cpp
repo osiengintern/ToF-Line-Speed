@@ -1,9 +1,3 @@
-// TODO: Decrease precision from #.### to #.## to improve time til overflow from 49 days (7 weeks) to roughly 497 days (more than 1 year).
-// TODO: URGENT: 2077 gets reduced to 2.77 in the serial debugging.
-// TODO: Add rolling average display function, add clock time function as well.
-// TODO: 350 feet to oven. Calculate the time it would take to reach there.
-// TODO: might want to add a minimum distance range as well for object detection.
-
 #include <Wire.h>
 #include "Arduino.h"
 #include "Adafruit_VL53L1X.h"
@@ -12,17 +6,19 @@
 #include "RTClib.h"
 
 #define MAXIMUM_THRESHOLD_DISTANCE 1000 //millimeters
-#define MINIMUM_THRESHOLD_DISTANCE 500 //millimeters
+#define MINIMUM_THRESHOLD_DISTANCE 150 //millimeters
 #define RTC_PRINT_INTERVAL 5 //seconds (the time in between RTC print outs)
 #define OBJECT_DETECTION_TIMING_THRESHOLD 200 //milliseconds
+#define LINE_STOPPED_THRESHOLD 30 //seconds
 #define ROLLING_AVERAGE_ARRAY_SIZE 10
-#define INCHES_BETWEEN_VL53L1X_SENSORS 4
+#define INCHES_BETWEEN_VL53L1X_SENSORS 3.75
 #define DISTANCE_FROM_MONITOR_TO_OVEN 350 //feet
 #define TOTAL_LENGTH_OF_OVEN 225 //feet
 
 // DS3231 Real Time Clock stuff
 RTC_DS3231 rtc;
 unsigned long previousMillis_RTCPrintOut = 0; // the last time the time was printed to serial from the RTC
+DateTime lastDetectedObject;
 
 // 1.2" 7-Segment Display stuff
 Adafruit_7segment FPSDisplay = Adafruit_7segment();
@@ -34,7 +30,7 @@ int findNextAvailableIndexInArray(unsigned long[]);
 int addValueToArray(unsigned long[], unsigned long, int);
 int addValueToArray(double[], double, int);
 void calculateLineSpeed(int);
-DateTime timeToStopHanging(DateTime);
+void calculateTimeToStopHanging(DateTime);
 
 unsigned long VLOneDetectionTimes[ROLLING_AVERAGE_ARRAY_SIZE]; // 0x2A (42)
 unsigned long VLTwoDetectionTimes[ROLLING_AVERAGE_ARRAY_SIZE]; // 0x2B (43)
@@ -65,7 +61,7 @@ ToFSensor::ToFSensor(int ID) {
 }
 
 void ToFSensor::objectDetectCheck() {
-  if (measurementDistance == -1 || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
+  if (measurementDistance == -1 || measurementDistance <= MINIMUM_THRESHOLD_DISTANCE || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
     if (!previousMeasurementLost) { // only runs once (the first time when sensor can no longer detect a T-Bar)
       millisObjectLost = millis(); // timestamp of when the sensor can no longer detect a t-bar
 
@@ -93,6 +89,7 @@ void ToFSensor::objectDetectCheck() {
     if ((millis() - holdingMillis > OBJECT_DETECTION_TIMING_THRESHOLD) && !previousObjectDetected) {
       millisObjectDetected = holdingMillis;
       previousObjectDetected = true;
+      lastDetectedObject = rtc.now();
 
       int nextVLOneIndex = findNextAvailableIndexInArray(VLOneDetectionTimes);
       int nextVLTwoIndex = findNextAvailableIndexInArray(VLTwoDetectionTimes);
@@ -194,6 +191,8 @@ void setup() {
     while (1) delay(10);
   }
 
+  lastDetectedObject = rtc.now();
+
   for (int i = 0; i < 2; i++) {
     pinMode(xshutPins[i], OUTPUT);
     digitalWrite(xshutPins[i], LOW);
@@ -256,7 +255,7 @@ void setup() {
 
 void loop() {
   DateTime now = rtc.now();
-  //printCurrentTime(now);
+  printCurrentTime(now);
 
   if (VLSensorArray[0].dataReady()) {
 
@@ -272,21 +271,20 @@ void loop() {
 
   }
 
-  DateTime stopHanging = timeToStopHanging(now);
+  //clockDisplay is written in calculateTimeToStopHanging()
+  calculateTimeToStopHanging(now);
 
-
-  //FPSDisplay.print(timeToStopHanging(now));
-  FPSDisplay.drawColon(true);
-  FPSDisplay.writeDisplay();
-
-  //clockDisplay.print(VLSensorArray[1].millisObjectDetected / 10);
-  clockDisplay.print(rollingAverageLineSpeed);
-  if (rollingAverageLineSpeed >= 100) {
-    clockDisplay.writeDigitRaw(2, 0x10);
+  if (now.secondstime() - LINE_STOPPED_THRESHOLD >= lastDetectedObject.secondstime()) {
+    FPSDisplay.print(11111);
   } else {
-    clockDisplay.writeDigitRaw(2, 0x02);
+    FPSDisplay.print(rollingAverageLineSpeed);
+    if (rollingAverageLineSpeed >= 100) {
+      FPSDisplay.writeDigitRaw(2, 0x10);
+    } else {
+      FPSDisplay.writeDigitRaw(2, 0x02);
+    }
   }
-  clockDisplay.writeDisplay();
+  FPSDisplay.writeDisplay();
 
   //printDebugToSerial();
   DEBUG_HERTZ_COUNTER++;
@@ -401,16 +399,18 @@ void calculateLineSpeed(int insertIndex) {
   Serial.println(sum);
 }
 
-DateTime timeToStopHanging(DateTime now) {
+void calculateTimeToStopHanging(DateTime now) {
   
   int minutesUntilPartsReachOven = int((DISTANCE_FROM_MONITOR_TO_OVEN / rollingAverageLineSpeed) + 0.5);
 
   int minutesPartsInOven = int((TOTAL_LENGTH_OF_OVEN / rollingAverageLineSpeed + 0.5));
 
-  DateTime lineStopTime (now.year(), now.month(), now.day(), 16, 30, 0);
-  DateTime stopHangingTime (lineStopTime - TimeSpan(0, 0, (minutesUntilPartsReachOven + minutesPartsInOven), 0));
+  DateTime closingTime (now.year(), now.month(), now.day(), 16, 30, 0); // CLOSING TIME IS AT 4:30
+  DateTime stopHangingTime (closingTime - TimeSpan(0, 0, (minutesUntilPartsReachOven + minutesPartsInOven), 0));
 
-  return stopHangingTime;
+  clockDisplay.print(stopHangingTime.twelveHour() * 100 + stopHangingTime.minute());
+  clockDisplay.drawColon(true);
+  clockDisplay.writeDisplay();
 }
 
 void printDebugToSerial() {
@@ -422,14 +422,14 @@ void printDebugToSerial() {
   Serial.println(VLSensorArray[1].measurementDistance);
   
   // TODO: improve the hertz rate. it's going from 90s to 70s because of the division i assume.
+  char formattedTime[10];
+
   Serial.print(F("Last Detection:  "));
-  Serial.print(VLSensorArray[0].millisObjectDetected / 1000);
-  Serial.print(F("."));
-  Serial.print(VLSensorArray[0].millisObjectDetected % 1000);
+  sprintf(formattedTime, "%lu.%03lu", VLSensorArray[0].millisObjectDetected / 1000, VLSensorArray[0].millisObjectDetected % 1000);
+  Serial.print(formattedTime);
   Serial.print(F(" \t \t "));
-  Serial.print(VLSensorArray[1].millisObjectDetected / 1000);
-  Serial.print(F("."));
-  Serial.println(VLSensorArray[1].millisObjectDetected % 1000);
+  sprintf(formattedTime, "%lu.%03lu", VLSensorArray[1].millisObjectDetected / 1000, VLSensorArray[1].millisObjectDetected % 1000);
+  Serial.println(formattedTime);
   Serial.println(F("(#.### s)  "));
   Serial.println();
   
