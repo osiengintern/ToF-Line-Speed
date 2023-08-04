@@ -5,15 +5,17 @@
 #include "Adafruit_LEDBackpack.h"
 #include "RTClib.h"
 
-#define MAXIMUM_THRESHOLD_DISTANCE 1000 //millimeters
-#define MINIMUM_THRESHOLD_DISTANCE 150 //millimeters
+#define MAXIMUM_THRESHOLD_DISTANCE 900 //millimeters
+//#define MINIMUM_THRESHOLD_DISTANCE 100 //millimeters. (REMOVED BC IT IS ANNOYING)
 #define RTC_PRINT_INTERVAL 5 //seconds (the time in between RTC print outs)
-#define OBJECT_DETECTION_TIMING_THRESHOLD 200 //milliseconds
-#define LINE_STOPPED_THRESHOLD 30 //seconds
-#define ROLLING_AVERAGE_ARRAY_SIZE 10
+#define OBJECT_DETECTION_TIMING_THRESHOLD 50 //milliseconds
+#define ROLLING_AVERAGE_ARRAY_SIZE 5
 #define INCHES_BETWEEN_VL53L1X_SENSORS 3.75
 #define DISTANCE_FROM_MONITOR_TO_OVEN 350 //feet
 #define TOTAL_LENGTH_OF_OVEN 225 //feet
+
+#define LINE_STOP_TIMEOUT 60 //seconds
+#define MONITOR_SLEEP_TIMEOUT 180 //seconds
 
 // DS3231 Real Time Clock stuff
 RTC_DS3231 rtc;
@@ -23,6 +25,8 @@ DateTime lastDetectedObject;
 // 1.2" 7-Segment Display stuff
 Adafruit_7segment FPSDisplay = Adafruit_7segment();
 Adafruit_7segment clockDisplay = Adafruit_7segment();
+
+int wireTimeoutCount = 0;
 
 void printCurrentTime(DateTime);
 void printDebugToSerial();
@@ -61,7 +65,8 @@ ToFSensor::ToFSensor(int ID) {
 }
 
 void ToFSensor::objectDetectCheck() {
-  if (measurementDistance == -1 || measurementDistance <= MINIMUM_THRESHOLD_DISTANCE || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
+  //if (measurementDistance == -1 || measurementDistance <= MINIMUM_THRESHOLD_DISTANCE || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE)
+  if (measurementDistance == -1  || measurementDistance >= MAXIMUM_THRESHOLD_DISTANCE) { // the sensor is no longer able to detect a T-Bar/Component
     if (!previousMeasurementLost) { // only runs once (the first time when sensor can no longer detect a T-Bar)
       millisObjectLost = millis(); // timestamp of when the sensor can no longer detect a t-bar
 
@@ -183,7 +188,12 @@ int DEBUG_HERTZ_COUNTER;
 void setup() {
   while (!Serial); // wait for serial port to connect. Needed for native USB
   Serial.begin(115200);
-  Wire.begin();
+  //Wire.begin();
+
+  //Wire stuff? Hopefully this will stop the program from hanging.
+  Wire.setWireTimeout(3000, true);
+  wireTimeoutCount = 0;
+  Wire.clearWireTimeoutFlag();
 
   if (! rtc.begin()) {
     Serial.println("Couldn't find RTC");
@@ -234,8 +244,8 @@ void setup() {
   Serial.println(F("All VL53L1X sensors are initialized!"));
 
   // 1.2" 7-Segment Display stuff
-  FPSDisplay.begin(0x71);
-  clockDisplay.begin(0x70);
+  FPSDisplay.begin(0x70);
+  clockDisplay.begin(0x71);
 
   FPSDisplay.print("INIT");
   clockDisplay.print("INIT");
@@ -271,11 +281,21 @@ void loop() {
 
   }
 
-  //clockDisplay is written in calculateTimeToStopHanging()
-  calculateTimeToStopHanging(now);
+  if (now.secondstime() - MONITOR_SLEEP_TIMEOUT >= lastDetectedObject.secondstime()) {
+    FPSDisplay.clear();
+    clockDisplay.clear();
+    clockDisplay.writeDisplay();
+  } else if (now.secondstime() - LINE_STOP_TIMEOUT >= lastDetectedObject.secondstime()) {
+    // line is stopped.
+    // time out displays
+    FPSDisplay.println(99999);
+    FPSDisplay.drawColon(false);
+    clockDisplay.println(99999);
+    clockDisplay.drawColon(false);
+    clockDisplay.writeDisplay();
 
-  if (now.secondstime() - LINE_STOPPED_THRESHOLD >= lastDetectedObject.secondstime()) {
-    FPSDisplay.print(11111);
+    FPSDisplay.blinkRate(HT16K33_BLINK_OFF);
+    clockDisplay.blinkRate(HT16K33_BLINK_OFF);
   } else {
     FPSDisplay.print(rollingAverageLineSpeed);
     if (rollingAverageLineSpeed >= 100) {
@@ -283,8 +303,20 @@ void loop() {
     } else {
       FPSDisplay.writeDigitRaw(2, 0x02);
     }
+
+    //clockDisplay is written in calculateTimeToStopHanging()
+    calculateTimeToStopHanging(now);
   }
   FPSDisplay.writeDisplay();
+
+  if (Wire.getWireTimeoutFlag()) {
+    wireTimeoutCount++;
+    Wire.clearWireTimeoutFlag();
+    Serial.println();
+    Serial.print("Wire timeout detected. Count is now: ");
+    Serial.println(wireTimeoutCount);
+    Serial.println();
+  }
 
   //printDebugToSerial();
   DEBUG_HERTZ_COUNTER++;
@@ -399,17 +431,44 @@ void calculateLineSpeed(int insertIndex) {
   Serial.println(sum);
 }
 
-void calculateTimeToStopHanging(DateTime now) {
+void calculateTimeToStopHanging(DateTime time) {
   
   int minutesUntilPartsReachOven = int((DISTANCE_FROM_MONITOR_TO_OVEN / rollingAverageLineSpeed) + 0.5);
 
   int minutesPartsInOven = int((TOTAL_LENGTH_OF_OVEN / rollingAverageLineSpeed + 0.5));
 
-  DateTime closingTime (now.year(), now.month(), now.day(), 16, 30, 0); // CLOSING TIME IS AT 4:30
-  DateTime stopHangingTime (closingTime - TimeSpan(0, 0, (minutesUntilPartsReachOven + minutesPartsInOven), 0));
+  DateTime closingTime (time.year(), time.month(), time.day(), 16, 30, 0); // CLOSING TIME IS AT 4:30
+  DateTime stopHanging (closingTime - TimeSpan(0, 0, (minutesUntilPartsReachOven + minutesPartsInOven), 0));
+  DateTime startHangingAgain (closingTime - TimeSpan(0, 0, minutesUntilPartsReachOven, 0));
+  DateTime fiveMinuteBuffer (startHangingAgain + TimeSpan(0, 0, 50, 0));
 
-  clockDisplay.print(stopHangingTime.twelveHour() * 100 + stopHangingTime.minute());
-  clockDisplay.drawColon(true);
+  /* DEBUG DATETIMES
+  DateTime stopHanging (time.year(), time.month(), time.day(), 11, 1, 30);
+  DateTime startHangingAgain (time.year(), time.month(), time.day(), 11, 1, 35);
+  DateTime fiveMinuteBuffer (startHangingAgain + TimeSpan(0, 0, 0, 5));
+  */
+
+  if (time.operator>=(fiveMinuteBuffer)) {
+    clockDisplay.clear();
+    clockDisplay.blinkRate(HT16K33_BLINK_OFF);
+    clockDisplay.drawColon(false);
+
+  } else if (time.operator>=(startHangingAgain)) {
+    clockDisplay.println(F(" GO "));
+    clockDisplay.blinkRate(HT16K33_BLINK_1HZ);
+    clockDisplay.drawColon(false);
+
+  } else if (time.operator>=(stopHanging)) {
+    clockDisplay.println(F("STOP"));
+    clockDisplay.blinkRate(HT16K33_BLINK_1HZ);
+    clockDisplay.drawColon(false);
+
+  } else {
+    clockDisplay.print(stopHanging.twelveHour() * 100 + stopHanging.minute());
+    clockDisplay.blinkRate(HT16K33_BLINK_OFF);
+    clockDisplay.drawColon(true);
+  }
+
   clockDisplay.writeDisplay();
 }
 
